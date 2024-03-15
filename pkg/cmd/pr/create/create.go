@@ -52,6 +52,8 @@ type CreateOptions struct {
 	WebMode     bool
 	RecoverFile string
 
+	PushRepo string // otherwise prompts
+
 	IsDraft    bool
 	Title      string
 	Body       string
@@ -225,6 +227,7 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 	fl.StringVar(&opts.RecoverFile, "recover", "", "Recover input from a failed run of create")
 	fl.StringVarP(&opts.Template, "template", "T", "", "Template `file` to use as starting body text")
 	fl.BoolVar(&opts.DryRun, "dry-run", false, "Print details instead of creating the PR. May still push git changes.")
+	fl.StringVarP(&opts.PushRepo, "push-repo", "P", "", "The repository in which the pull request will be created")
 
 	_ = cmdutil.RegisterBranchCompletionFlags(f.GitClient, cmd, "base", "head")
 
@@ -315,9 +318,11 @@ func createRun(opts *CreateOptions) (err error) {
 	}
 
 	if opts.FillVerbose || opts.Autofill || opts.FillFirst || (opts.TitleProvided && opts.BodyProvided) {
-		err = handlePush(*opts, *ctx)
-		if err != nil {
-			return
+		if !opts.DryRun {
+			err = handlePush(*opts, *ctx)
+			if err != nil {
+				return
+			}
 		}
 		return submitPR(*opts, *ctx, *state)
 	}
@@ -617,43 +622,59 @@ func NewCreateContext(opts *CreateOptions) (*CreateContext, error) {
 			}
 		}
 
-		currentLogin, err := api.CurrentLoginName(client, baseRepo.RepoHost())
-		if err != nil {
-			return nil, err
-		}
-
-		hasOwnFork := false
-		var pushOptions []string
-		for _, r := range pushableRepos {
-			pushOptions = append(pushOptions, ghrepo.FullName(r))
-			if r.RepoOwner() == currentLogin {
-				hasOwnFork = true
+		if opts.PushRepo != "" {
+			for _, r := range pushableRepos {
+				remote, err := remotes.FindByRepo(r.RepoOwner(), r.RepoName())
+				remoteMatch := err == nil && remote.Name == opts.PushRepo
+				if remoteMatch || ghrepo.FullName(r) == opts.PushRepo {
+					headRepo = r
+					if !ghrepo.IsSame(baseRepo, headRepo) {
+						headBranchLabel = fmt.Sprintf("%s:%s", headRepo.RepoOwner(), headBranch)
+					}
+				}
 			}
-		}
-
-		if !hasOwnFork {
-			pushOptions = append(pushOptions, "Create a fork of "+ghrepo.FullName(baseRepo))
-		}
-		pushOptions = append(pushOptions, "Skip pushing the branch")
-		pushOptions = append(pushOptions, "Cancel")
-
-		selectedOption, err := opts.Prompter.Select(fmt.Sprintf("Where should we push the '%s' branch?", headBranch), "", pushOptions)
-		if err != nil {
-			return nil, err
-		}
-
-		if selectedOption < len(pushableRepos) {
-			headRepo = pushableRepos[selectedOption]
-			if !ghrepo.IsSame(baseRepo, headRepo) {
-				headBranchLabel = fmt.Sprintf("%s:%s", headRepo.RepoOwner(), headBranch)
+			if headRepo == nil {
+				return nil, fmt.Errorf("could not find push repository %q", opts.PushRepo)
 			}
-		} else if pushOptions[selectedOption] == "Skip pushing the branch" {
-			isPushEnabled = false
-		} else if pushOptions[selectedOption] == "Cancel" {
-			return nil, cmdutil.CancelError
 		} else {
-			// "Create a fork of ..."
-			headBranchLabel = fmt.Sprintf("%s:%s", currentLogin, headBranch)
+			currentLogin, err := api.CurrentLoginName(client, baseRepo.RepoHost())
+			if err != nil {
+				return nil, err
+			}
+
+			hasOwnFork := false
+			var pushOptions []string
+			for _, r := range pushableRepos {
+				pushOptions = append(pushOptions, ghrepo.FullName(r))
+				if r.RepoOwner() == currentLogin {
+					hasOwnFork = true
+				}
+			}
+
+			if !hasOwnFork {
+				pushOptions = append(pushOptions, "Create a fork of "+ghrepo.FullName(baseRepo))
+			}
+			pushOptions = append(pushOptions, "Skip pushing the branch")
+			pushOptions = append(pushOptions, "Cancel")
+
+			selectedOption, err := opts.Prompter.Select(fmt.Sprintf("Where should we push the '%s' branch?", headBranch), "", pushOptions)
+			if err != nil {
+				return nil, err
+			}
+
+			if selectedOption < len(pushableRepos) {
+				headRepo = pushableRepos[selectedOption]
+				if !ghrepo.IsSame(baseRepo, headRepo) {
+					headBranchLabel = fmt.Sprintf("%s:%s", headRepo.RepoOwner(), headBranch)
+				}
+			} else if pushOptions[selectedOption] == "Skip pushing the branch" {
+				isPushEnabled = false
+			} else if pushOptions[selectedOption] == "Cancel" {
+				return nil, cmdutil.CancelError
+			} else {
+				// "Create a fork of ..."
+				headBranchLabel = fmt.Sprintf("%s:%s", currentLogin, headBranch)
+			}
 		}
 	}
 
